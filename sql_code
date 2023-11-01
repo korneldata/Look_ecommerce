@@ -1,0 +1,200 @@
+
+-- RETURNS
+-- Compare return rate in particular years vs average return rate
+
+CREATE VIEW `look_ecommerce.return_rates` AS
+WITH return_rates AS 
+(
+SELECT 
+  DISTINCT EXTRACT(YEAR FROM created_at) AS year,
+  AVG(COUNT(CASE WHEN status = "Returned" THEN 1 END)
+    / COUNT(*) * 100) OVER (PARTITION BY EXTRACT(YEAR FROM created_at)) AS year_return_rate,
+  AVG(COUNT(CASE WHEN status = "Returned" THEN 1 END)
+    / COUNT(*) * 100) OVER () AS avg_return_rate
+FROM `bigquery-public-data.thelook_ecommerce.order_items`
+GROUP BY created_at
+)
+SELECT 
+  year,
+  ROUND(year_return_rate, 2) AS annual_return_rate ,
+  ROUND(avg_return_rate, 2) AS overall_return_rate,
+  ROUND(year_return_rate - avg_return_rate, 2) AS difference
+FROM return_rates
+ORDER BY 1;
+
+-- Find most returned product in each category
+
+CREATE VIEW `look_ecommerce.category_returns` AS
+WITH categories AS
+(
+SELECT
+  category,
+  name,
+  COUNT(product_id) AS product_count,
+  ROW_NUMBER() OVER (PARTITION BY category ORDER BY COUNT(product_id) DESC) AS ranking
+FROM `bigquery-public-data.thelook_ecommerce.order_items` AS order_items
+INNER JOIN `bigquery-public-data.thelook_ecommerce.products` AS products
+ON order_items.product_id = products.id
+WHERE status = "Returned"
+GROUP BY GROUPING SETS
+(
+  (category, name)
+) 
+)
+SELECT
+  category,
+  name,
+  product_count
+FROM categories
+WHERE ranking IN (1)
+ORDER BY product_count DESC;
+
+-- LOGISTICS
+-- Check whether the number of items per order affects time span between placing order and shipping
+
+CREATE VIEW `look_ecommerce.items_per_order` AS
+SELECT
+  num_of_item,
+  ROUND(AVG(DATE_DIFF(shipped_at,created_at,HOUR)), 2) AS hrs_diff
+FROM `bigquery-public-data.thelook_ecommerce.orders`
+GROUP BY num_of_item
+ORDER BY num_of_item;
+
+-- Compare performance of distribution centres with average time span between placing order and shipping 
+
+CREATE VIEW `look_ecommerce.distibution_centers` AS 
+WITH shipping AS 
+(
+SELECT 
+  DISTINCT name,
+  AVG(DATE_DIFF(orders.shipped_at, orders.created_at, HOUR)) OVER (PARTITION BY name) AS hours_diff_per_center,
+  AVG(DATE_DIFF(orders.shipped_at, orders.created_at, HOUR)) OVER () AS hours_diff_overall
+FROM `bigquery-public-data.thelook_ecommerce.orders` AS orders
+INNER JOIN`bigquery-public-data.thelook_ecommerce.order_items` AS order_items
+ON orders.order_id = order_items.order_id
+INNER JOIN `bigquery-public-data.thelook_ecommerce.inventory_items` AS inventory_items
+ON order_items.inventory_item_id = inventory_items.id
+INNER JOIN `bigquery-public-data.thelook_ecommerce.distribution_centers` AS distribution_centers
+ON inventory_items.product_distribution_center_id = distribution_centers.id
+)
+SELECT
+  DISTINCT name,
+  ROUND(hours_diff_per_center, 2) AS hrs_diff_center,
+  ROUND(hours_diff_overall, 2) AS overall_hrs_diff,
+  ROUND(hours_diff_per_center - hours_diff_overall, 2) AS difference
+FROM shipping
+ORDER BY hrs_diff_center;
+
+-- SALES
+-- Check sales record for December throughout all years
+
+CREATE VIEW `look_ecommerce.sales_december` AS 
+WITH december_revenue AS 
+(
+SELECT
+  FORMAT_DATETIME('%Y-%m',orders.created_at) AS year_month,
+  FLOOR(SUM(num_of_item * sale_price)) AS revenue
+FROM `bigquery-public-data.thelook_ecommerce.orders` AS orders
+INNER JOIN `bigquery-public-data.thelook_ecommerce.order_items` AS items
+ON orders.order_id = items.order_id
+WHERE orders.status = "Complete"
+AND FORMAT_DATETIME('%Y-%m',orders.created_at) LIKE '____-12'
+GROUP BY year_month
+)
+SELECT
+  year_month,
+  revenue,
+  revenue - LAG(revenue) OVER (ORDER BY year_month) AS prev_year_revenue_diff,
+  ROUND((revenue - LAG(revenue) OVER (ORDER BY year_month)) * 100/LAG(revenue) OVER (ORDER BY year_month), 2) AS perc_change
+FROM december_revenue
+ORDER BY year_month;
+
+-- Get YTD sales for each brand
+
+CREATE VIEW `look_ecommerce.sales_ytd_2` AS
+SELECT
+  brand,
+  CEILING(SUM(num_of_item * sale_price)) AS sales_ytd,
+FROM `bigquery-public-data.thelook_ecommerce.orders` AS orders
+INNER JOIN `bigquery-public-data.thelook_ecommerce.order_items` AS items
+ON orders.order_id = items.order_id 
+INNER JOIN `bigquery-public-data.thelook_ecommerce.products` AS products
+ON products.id = items.order_id
+WHERE DATE(orders.created_at) >= DATE_TRUNC(CURRENT_DATE(), YEAR)
+AND DATE(orders.created_at) < CURRENT_DATE()
+AND orders.status NOT IN ('Returned', 'Cancelled')
+GROUP BY brand
+ORDER BY sales_ytd DESC;
+
+-- CUSTOMERS
+-- Find customers whose last purchase was more than 100 days ago
+
+CREATE VIEW `look_ecommerce.customers_hundred_days` AS
+WITH last_orders AS 
+(
+SELECT 
+  DISTINCT users.id AS user_id,
+  first_name,
+  last_name,
+  email,
+  LAST_VALUE(orders.created_at) OVER (PARTITION BY users.id ORDER BY orders.created_at 
+  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_order
+FROM `bigquery-public-data.thelook_ecommerce.orders` AS orders
+INNER JOIN `bigquery-public-data.thelook_ecommerce.users` AS users 
+ON orders.user_id = users.id
+)
+SELECT
+  user_id,
+  first_name,
+  last_name,
+  email,
+  last_order,
+  DATE_DIFF(CURRENT_TIMESTAMP(), last_order, DAY) AS days_last_order,
+  COUNT(*) OVER() AS customer_count
+FROM last_orders
+WHERE DATE_DIFF(CURRENT_TIMESTAMP(), last_order, DAY) > 100
+ORDER BY user_id;
+
+-- Provide personal details of female customers from China aged 20 - 40 
+
+CREATE VIEW `look_ecommerce.chinese_customers` AS 
+SELECT
+  id,
+  first_name,
+  last_name,
+  email
+FROM `bigquery-public-data.thelook_ecommerce.users`
+WHERE country = "China"
+AND gender = "F"
+AND age BETWEEN 20 AND 40;
+
+-- Provide a list of 10 customers with the biggest spending 
+
+CREATE VIEW `look_ecommerce.top_ten` AS
+SELECT
+  users.id,
+  first_name,
+  last_name,
+  email,
+  ROUND(SUM(sale_price * num_of_item), 2) AS customer_spent,
+  ROW_NUMBER() OVER (ORDER BY SUM(sale_price * num_of_item) DESC) AS customer_ranking
+FROM `bigquery-public-data.thelook_ecommerce.users` AS users
+INNER JOIN `bigquery-public-data.thelook_ecommerce.orders` AS orders
+ON users.id = orders.user_id
+INNER JOIN `bigquery-public-data.thelook_ecommerce.order_items` AS order_items
+ON order_items.user_id = orders.user_id
+WHERE orders.status NOT IN ('Returned', 'Cancelled')
+GROUP BY 1, 2, 3, 4
+LIMIT 10;
+ 
+-- TRAFFIC SOURCES
+
+CREATE VIEW `look_ecommerce.traffic_sources` AS
+SELECT 
+  DISTINCT EXTRACT(YEAR FROM created_at) AS year,
+  traffic_source,
+  COUNT(*) OVER (PARTITION BY EXTRACT (YEAR FROM created_at), traffic_source) AS num_of_users,
+  ROUND(COUNT(*) OVER (PARTITION BY EXTRACT (YEAR FROM created_at), traffic_source)
+    / COUNT(*) OVER (PARTITION BY EXTRACT(YEAR FROM created_at)) * 100, 2) AS percentage
+FROM `bigquery-public-data.thelook_ecommerce.users`
+ORDER BY year;
